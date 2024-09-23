@@ -3,12 +3,24 @@ const bodyParser = require('body-parser');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const auth = require('basic-auth');
 
 const app = express();
 app.use(bodyParser.json());
 
 const scriptDir = path.join(__dirname, 'script');
 const outputDir = path.join(__dirname, 'output_user');
+
+// Middleware for basic authentication
+const basicAuth = (req, res, next) => {
+    const credentials = auth(req);
+
+    if (!credentials || credentials.name !== 'Administrator' || credentials.pass !== 'ah4cbbl59qg29erm9omm9g5b5m06goqic39tyh133nbq7tch36ere4y80wnvfoxv') {
+        res.setHeader('WWW-Authenticate', 'Basic realm="example"');
+        return res.status(401).json({ message: 'Access denied' });
+    }
+    next();
+};
 
 const runPowerShellCommand = (command) => {
     return new Promise((resolve, reject) => {
@@ -46,11 +58,16 @@ const readFile = (filePath) => {
     });
 };
 
+// Basic route for API status
 app.get('/', (req, res) => {
     res.status(200).json({ message: 'API Active' });
 });
 
-app.get('/export-ca-cert', async (req, res) => {
+// Protected routes under /api/v1 with Basic Auth
+app.use('/api/v1', basicAuth);
+
+// Export CA certificate
+app.get('/api/v1/export-ca-cert', async (req, res) => {
     const caName = req.query.CAName;
     if (!caName) {
         return res.status(400).json({ error: 'CAName parameter is required' });
@@ -68,7 +85,8 @@ app.get('/export-ca-cert', async (req, res) => {
     }
 });
 
-app.post('/revoke-cert', async (req, res) => {
+// Revoke certificate
+app.post('/api/v1/revoke-cert', async (req, res) => {
     const { SubjectName } = req.body;
     if (!SubjectName) {
         return res.status(400).json({ error: 'SubjectName parameter is required' });
@@ -86,7 +104,7 @@ app.post('/revoke-cert', async (req, res) => {
     }
 });
 
-app.post('/create-user-and-certificate', async (req, res) => {
+app.post('/api/v1/create-user-and-certificate', async (req, res) => {
     console.log("Received a request to create user and certificate...");
     const { Name, UserPassword, Group, SubjectName, SubjectAltName, TemplateName, CAConfig, PfxPassword, Domain } = req.body;
 
@@ -94,14 +112,31 @@ app.post('/create-user-and-certificate', async (req, res) => {
         return res.status(400).json({ error: 'All fields are required' });
     }
 
-    const createUserCommand = `$Password = ConvertTo-SecureString '${UserPassword}' -AsPlainText -Force; New-ADUser -Name '${Name}' -GivenName '${Name}' -SamAccountName '${Name}' -UserPrincipalName '${Name}@${Domain}' -DisplayName '${Name}' -AccountPassword $Password -ChangePasswordAtLogon $false -PasswordNeverExpires $true -CannotChangePassword $true -Enabled $true; Add-ADGroupMember -Identity '${Group}' -Members '${Name}';`;
-
     try {
-        await runPowerShellCommand(createUserCommand);
-        console.log("User created successfully");
+        // Check if user exists in Active Directory
+        const checkUserCommand = `Get-ADUser -Filter {SamAccountName -eq '${Name}'}`;
+        const userExists = await runPowerShellCommand(checkUserCommand);
+        
+        if (!userExists) {
+            // If user does not exist, create the user
+            const createUserCommand = `$Password = ConvertTo-SecureString '${UserPassword}' -AsPlainText -Force; New-ADUser -Name '${Name}' -GivenName '${Name}' -SamAccountName '${Name}' -UserPrincipalName '${Name}@${Domain}' -DisplayName '${Name}' -AccountPassword $Password -ChangePasswordAtLogon $false -PasswordNeverExpires $true -CannotChangePassword $true -Enabled $true; Add-ADGroupMember -Identity '${Group}' -Members '${Name}';`;
+            await runPowerShellCommand(createUserCommand);
+            console.log("User created successfully");
+        } else {
+            console.log("User already exists, skipping user creation...");
+        }
 
-        const formattedCAConfig = CAConfig.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
-        const infContent = 
+        // Check if certificate exists in the certificate store
+        const checkCertCommand = `Get-ChildItem -Path Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq 'CN=${SubjectName}' } | Select-Object -ExpandProperty Thumbprint`;
+        const existingThumbprint = (await runPowerShellCommand(checkCertCommand)).trim();
+
+        let thumbprint = existingThumbprint;
+
+        if (!existingThumbprint) {
+            console.log("Certificate does not exist, creating certificate...");
+
+            const formattedCAConfig = CAConfig.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            const infContent = 
 `[Version]
 Signature="$Windows NT$"
 
@@ -132,65 +167,68 @@ OID=1.3.6.1.5.5.7.3.2 ; Client Authentication
 CertificateTemplate = "${TemplateName}"
 `;
 
-        const infPath = path.join(outputDir, `${Name}-request.inf`);
-        const reqFilePath = path.join(outputDir, `${Name}-request.req`);
-        const certFilePath = path.join(outputDir, `${Name}.cer`);
-        const pfxFilePath = path.join(outputDir, `${Name}.pfx`);
+            const infPath = path.join(outputDir, `${Name}-request.inf`);
+            const reqFilePath = path.join(outputDir, `${Name}-request.req`);
+            const certFilePath = path.join(outputDir, `${Name}.cer`);
+            const pfxFilePath = path.join(outputDir, `${Name}.pfx`);
 
-        await writeFile(infPath, infContent);
+            await writeFile(infPath, infContent);
 
-        const certreqCommand = `certreq -config "${formattedCAConfig}" -new "${infPath}" "${reqFilePath}" ; certreq -config "${formattedCAConfig}" -submit "${reqFilePath}" "${certFilePath}" | Out-Null`;
-        await runPowerShellCommand(certreqCommand);
-        console.log("Certificate created successfully");
+            const certreqCommand = `certreq -config "${formattedCAConfig}" -new "${infPath}" "${reqFilePath}" ; certreq -config "${formattedCAConfig}" -submit "${reqFilePath}" "${certFilePath}" | Out-Null`;
+            await runPowerShellCommand(certreqCommand);
+            console.log("Certificate created successfully");
 
-        const installCertCommand = `Import-Certificate -FilePath "${certFilePath}" -CertStoreLocation "Cert:\\CurrentUser\\My"`;
-        await runPowerShellCommand(installCertCommand);
+            const installCertCommand = `Import-Certificate -FilePath "${certFilePath}" -CertStoreLocation "Cert:\\CurrentUser\\My"`;
+            await runPowerShellCommand(installCertCommand);
 
-        const thumbprintCommand = `Get-ChildItem -Path Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq 'CN=${SubjectName}' } | Select-Object -ExpandProperty Thumbprint`;
-        const thumbprint = (await runPowerShellCommand(thumbprintCommand)).trim();
+            const newThumbprintCommand = `Get-ChildItem -Path Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq 'CN=${SubjectName}' } | Select-Object -ExpandProperty Thumbprint`;
+            thumbprint = (await runPowerShellCommand(newThumbprintCommand)).trim();
+        } else {
+            console.log("Certificate already exists, skipping certificate creation...");
+        }
 
         if (!thumbprint) {
             return res.status(500).json({ error: 'Certificate not found or private key is missing' });
         }
 
+        const pfxFilePath = path.join(outputDir, `${Name}.pfx`);
         const pfxCommand = `Export-PfxCertificate -Cert "Cert:\\CurrentUser\\My\\${thumbprint}" -FilePath "${pfxFilePath}" -Password (ConvertTo-SecureString -String "${PfxPassword}" -AsPlainText -Force)`;
         await runPowerShellCommand(pfxCommand);
         console.log("Certificate exported successfully");
 
-        const convertCerCommand = `openssl pkcs12 -in "${pfxFilePath}" -clcerts -nokeys -out "${certFilePath}" -passin pass:${PfxPassword}`;
-        const convertKeyCommand = `openssl pkcs12 -in "${pfxFilePath}" -nocerts -out "${pfxFilePath}.key" -passin pass:${PfxPassword} -nodes`;
+        const convertCerCommand = `openssl pkcs12 -in "${pfxFilePath}" -clcerts -nokeys -out "${outputDir}/${Name}.cer" -passin pass:${PfxPassword}`;
+        const convertKeyCommand = `openssl pkcs12 -in "${pfxFilePath}" -nocerts -out "${outputDir}/${Name}.key" -passin pass:${PfxPassword} -nodes`;
 
         await runPowerShellCommand(`cmd /c "${convertCerCommand}"`);
         await runPowerShellCommand(`cmd /c "${convertKeyCommand}"`);
 
-        const certData = await readFile(certFilePath);
-        const keyData = await readFile(`${pfxFilePath}.key`);
+        const certData = await readFile(`${outputDir}/${Name}.cer`);
+        const keyData = await readFile(`${outputDir}/${Name}.key`);
 
         // Clean up certificate and private key
         const cleanCertData = certData.replace(/Bag Attributes[\s\S]*?-----BEGIN CERTIFICATE-----/, '-----BEGIN CERTIFICATE-----').replace(/-----END CERTIFICATE-----[\s\S]*/, '-----END CERTIFICATE-----').trim();
         const cleanKeyData = keyData.replace(/Bag Attributes[\s\S]*?-----BEGIN PRIVATE KEY-----/, '-----BEGIN PRIVATE KEY-----').replace(/-----END PRIVATE KEY-----[\s\S]*/, '-----END PRIVATE KEY-----').trim();
 
         // Publish the certificate to Active Directory
-        const publishCertCommand = `certutil -dspublish "${certFilePath}" "User"`;
+        const publishCertCommand = `certutil -dspublish "${outputDir}/${Name}.cer" "User"`;
 
         try {
-            const publishStdout = await runPowerShellCommand(publishCertCommand);
+            await runPowerShellCommand(publishCertCommand);
             console.log("Certificate published to Active Directory successfully");
         } catch (publishError) {
-            console.error(`Failed to publish certificate to Active Directory: ${publishError.error}`);
-            return res.status(500).json({ error: 'Failed to publish certificate to Active Directory', details: publishError.stderr });
+            console.error(`Failed to publish certificate to AD: ${publishError.error}`);
         }
 
         res.status(200).json({ certificate: cleanCertData, private_key: cleanKeyData });
-
-
     } catch (error) {
         console.error(`Error: ${error.error}`);
         res.status(500).json({ error: error.error, details: error.stderr });
     }
 });
 
-const port = 3000;
-app.listen(port, () => {
-    console.log(`API server running on port ${port}`);
+
+
+const PORT = 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });
