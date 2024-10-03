@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const auth = require('basic-auth');
 
+const config = require('./config.json'); 
 const app = express();
 app.use(bodyParser.json());
 
@@ -15,7 +16,7 @@ const outputDir = path.join(__dirname, 'output_user');
 const basicAuth = (req, res, next) => {
     const credentials = auth(req);
 
-    if (!credentials || credentials.name !== 'Administrator' || credentials.pass !== 'ah4cbbl59qg29erm9omm9g5b5m06goqic39tyh133nbq7tch36ere4y80wnvfoxv') {
+    if (!credentials || credentials.name !== config.username || credentials.pass !== config.password) {
         res.setHeader('WWW-Authenticate', 'Basic realm="example"');
         return res.status(401).json({ message: 'Access denied' });
     }
@@ -87,10 +88,13 @@ app.get('/api/v1/export-ca-cert', async (req, res) => {
 
 // Revoke certificate
 app.post('/api/v1/revoke-cert', async (req, res) => {
+    console.log("revoking certificate...")
     const { SubjectName } = req.body;
     if (!SubjectName) {
         return res.status(400).json({ error: 'SubjectName parameter is required' });
     }
+
+    console.log("revoking certificate with subjectName", SubjectName)
 
     const scriptPath = path.join(scriptDir, 'revoke-cert.ps1');
     const escapedSubjectName = SubjectName.replace(/"/g, '""');
@@ -105,10 +109,10 @@ app.post('/api/v1/revoke-cert', async (req, res) => {
 });
 
 app.post('/api/v1/create-user-and-certificate', async (req, res) => {
-    console.log("Received a request to create user and certificate...");
-    const { Name, UserPassword, Group, SubjectName, SubjectAltName, TemplateName, CAConfig, PfxPassword, Domain } = req.body;
+    console.log("Received a request to create user and certificate...", req.body);
+    const { Name, UserPassword, Group, SubjectName, SubjectAltName, TemplateName, ServerName, CAName, PfxPassword, Domain } = req.body;
 
-    if (!Name || !UserPassword || !Group || !SubjectName || !SubjectAltName || !TemplateName || !CAConfig || !PfxPassword || !Domain) {
+    if (!Name || !UserPassword || !Group || !SubjectName || !SubjectAltName || !TemplateName || !ServerName || !CAName || !PfxPassword || !Domain) {
         return res.status(400).json({ error: 'All fields are required' });
     }
 
@@ -135,7 +139,10 @@ app.post('/api/v1/create-user-and-certificate', async (req, res) => {
         if (!existingThumbprint) {
             console.log("Certificate does not exist, creating certificate...");
 
-            const formattedCAConfig = CAConfig.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            const formattedCAConfig = `${ServerName}\\${CAName}`
+            // console.log(CAConfig)
+            // const formattedCAConfig = CAConfig.replace(/\\/g, '\\\\').replace(/\n/g, '\\n');
+            // console.log(formattedCAConfig)
             const infContent = 
 `[Version]
 Signature="$Windows NT$"
@@ -219,7 +226,7 @@ CertificateTemplate = "${TemplateName}"
             console.error(`Failed to publish certificate to AD: ${publishError.error}`);
         }
 
-        res.status(200).json({ certificate: cleanCertData, private_key: cleanKeyData });
+        res.status(200).json({ certificate: cleanCertData, key: cleanKeyData });
     } catch (error) {
         console.error(`Error: ${error.error}`);
         res.status(500).json({ error: error.error, details: error.stderr });
