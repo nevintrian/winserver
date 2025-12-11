@@ -79,7 +79,11 @@ app.get('/api/v1/export-ca-cert', async (req, res) => {
 
     try {
         const stdout = await runPowerShellCommand(`& "${scriptPath}" -CAName "${escapedCaName}"`);
-        res.status(200).json({ certificate: stdout.trim() });
+        if (stdout.includes("not found")) {
+            res.status(404).json({ error: `CA certificate with name ${escapedCaName} not found.` });
+        } else {
+            res.status(200).json({ certificate: stdout.trim() });
+        }
     } catch (error) {
         console.error(`Error: ${error.error}`);
         res.status(500).json({ error: error.error, details: error.stderr });
@@ -226,7 +230,7 @@ CertificateTemplate = "${TemplateName}"
             console.error(`Failed to publish certificate to AD: ${publishError.error}`);
         }
 
-        res.status(200).json({ certificate: cleanCertData, key: cleanKeyData });
+        res.status(200).json({ certificate: cleanCertData, private_key: cleanKeyData });
     } catch (error) {
         console.error(`Error: ${error.error}`);
         res.status(500).json({ error: error.error, details: error.stderr });
